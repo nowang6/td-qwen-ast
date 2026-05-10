@@ -61,12 +61,24 @@ itn_pool: ITNPool = ITNPool()
 async def websocket_endpoint(websocket: WebSocket) -> None:
     """ASR 实时流式转录 WebSocket 端点。"""
 
+    client_host = websocket.client.host if websocket.client else "unknown"
+    client_port = websocket.client.port if websocket.client else 0
+    logger.info(
+        "New WebSocket connection attempt: client=%s:%s, active_slots=%d/%d",
+        client_host, client_port,
+        connection_manager._active_count, connection_manager._max_connections,
+    )
+
     # ---- 并发控制 ----
     if not connection_manager.try_acquire():
         await websocket.close(code=1013, reason="Try Again Later")
-        logger.warning("Connection rejected: max connections reached")
+        logger.warning(
+            "Connection rejected: max connections reached, client=%s:%s",
+            client_host, client_port,
+        )
         return
 
+    logger.info("Connection slot acquired: client=%s:%s", client_host, client_port)
     await websocket.accept()
     session = None
     connection_slot_released = False
@@ -77,7 +89,7 @@ async def websocket_endpoint(websocket: WebSocket) -> None:
         if session is None:
             connection_manager.release_slot()
             connection_slot_released = True
-            await _wait_for_client_disconnect(websocket)
+            await _close_connection(websocket)
             return
 
         # 注册连接
@@ -88,7 +100,13 @@ async def websocket_endpoint(websocket: WebSocket) -> None:
         # 回复握手成功
         await _send_response(websocket, session, status=0, seg_id=0)
         session.set_streaming()
-        logger.info("Handshake OK: sid=%s, biz_id=%s", session.sid, session.biz_id)
+
+        # 处理握手帧中携带的首帧音频
+        if session._first_audio_payload is not None:
+            await _handle_audio_frame(websocket, session, session._first_audio_payload)
+            session._first_audio_payload = None
+
+        logger.info("Connection opened: sid=%s, trace=%s, biz_id=%s", session.sid, session.trace_id, session.biz_id)
 
         # ---- 流式处理循环 ----
         while True:
@@ -99,15 +117,29 @@ async def websocket_endpoint(websocket: WebSocket) -> None:
                 await _handle_audio_frame(websocket, session, msg)
 
             elif msg.header.status == 2:
+                logger.info(
+                    "Client initiated graceful close: sid=%s, trace=%s, segs=%d",
+                    session.sid,
+                    session.trace_id,
+                    session.seg_id,
+                )
                 await _handle_end_frame(websocket, session)
-                await _wait_for_client_disconnect(websocket, session)
+                await _close_connection(websocket, session)
+                break
 
     except WebSocketDisconnect:
-        logger.info("Client disconnected: sid=%s", session.sid if session else "?")
+        logger.info(
+            "Client disconnected (wire close, no status=2): sid=%s, trace=%s, biz_id=%s, segs=%d, state=%s",
+            session.sid if session else "?",
+            session.trace_id if session else "?",
+            session.biz_id if session else "?",
+            session.seg_id if session else 0,
+            session.state.value if session else "no_session",
+        )
     except asyncio.TimeoutError:
         logger.warning("Handshake timeout")
         asr_errors_total.labels(error_type="handshake_timeout").inc()
-        await _wait_for_client_disconnect_safely(websocket, session)
+        await _close_connection(websocket, session)
     except Exception as exc:
         logger.exception("Unexpected error: %s", exc)
         asr_errors_total.labels(error_type="internal").inc()
@@ -115,16 +147,27 @@ async def websocket_endpoint(websocket: WebSocket) -> None:
             await _send_error(websocket, session, str(exc), status=2)
         except Exception:
             pass
-        await _wait_for_client_disconnect_safely(websocket, session)
+        await _close_connection(websocket, session)
     finally:
         if session:
+            pending_tasks = len([t for t in session._pending_asr_tasks if not t.done()])
+            logger.info(
+                "Cleaning up session: sid=%s, state=%s, pending_asr_tasks=%d",
+                session.sid, session.state.value, pending_tasks,
+            )
             session.close()  # 取消后台 ASR 任务 + 从 VAD 批处理器注销
             connection_manager.unregister(session.sid)
             connection_slot_released = True
             asr_connections_current.dec()
+            logger.info(
+                "Session cleanup complete: sid=%s, remaining_slots=%d/%d",
+                session.sid,
+                connection_manager._active_count, connection_manager._max_connections,
+            )
         elif not connection_slot_released:
             connection_manager.release_slot()
             connection_slot_released = True
+            logger.info("Released slot for session-less connection")
 
 
 # ============================================================
@@ -143,14 +186,28 @@ async def _handle_handshake(websocket: WebSocket) -> ASRSession | None:
         raise
 
     msg = ClientMessage.model_validate_json(raw)
+    logger.info(
+        "Handshake frame received: status=%d, traceId=%s, bizId=%s",
+        msg.header.status,
+        msg.header.traceId,
+        msg.header.bizId,
+    )
     if msg.header.status != 0:
-        logger.warning("First message must be handshake (status=0)")
+        logger.warning(
+            "First message must be handshake (status=0), got status=%d, traceId=%s — connection will be closed",
+            msg.header.status,
+            msg.header.traceId,
+        )
         return None
 
     session = ASRSession(
         trace_id=msg.header.traceId,
         biz_id=msg.header.bizId,
         app_id=msg.header.appId or "",
+    )
+    logger.info(
+        "ASRSession created: sid=%s, trace=%s, biz_id=%s, vad_instance=%s",
+        session.sid, session.trace_id, session.biz_id, id(session.vad),
     )
 
     # 追加客户端热词（与环境变量默认热词合并）
@@ -159,6 +216,10 @@ async def _handle_handshake(websocket: WebSocket) -> ASRSession | None:
         if client_ctx:
             base = build_hotword_context(settings.HOTWORDS)
             session.hotword_context = f"{base}\n{client_ctx}" if base else client_ctx
+
+    # 握手帧可能同时携带首帧音频数据
+    if msg.payload and msg.payload.audio:
+        session._first_audio_payload = msg
 
     return session
 
@@ -197,6 +258,20 @@ async def _handle_audio_frame(
     # 喂入 VAD（通过全局批处理器异步推理）
     segments = await session.vad.feed_audio(pcm_int16)
 
+    # 累计音频采样数，用于诊断网络延迟
+    session._accumulated_audio_samples += len(pcm_int16)
+    acc_audio_ms = samples_to_ms(session._accumulated_audio_samples)
+    conn_ms = int((time.monotonic() - session._connection_start_time) * 1000)
+    gap_ms = conn_ms - acc_audio_ms
+    logger.debug(
+        "Audio frame: sid=%s, frame_smps=%d, acc_audio_ms=%d, conn_ms=%d, gap_ms=%d",
+        session.sid,
+        len(pcm_int16),
+        acc_audio_ms,
+        conn_ms,
+        gap_ms,
+    )
+
     # 对每个触发的语音段，启动后台 ASR+ITN 任务（不阻塞音频接收）
     for seg in segments:
         task = asyncio.create_task(
@@ -231,28 +306,15 @@ async def _handle_end_frame(websocket: WebSocket, session: ASRSession) -> None:
             await _send_response(websocket, session, status=2, seg_id=last_seg_id)
 
 
-async def _wait_for_client_disconnect(
+async def _close_connection(
     websocket: WebSocket,
     session: ASRSession | None = None,
 ) -> None:
-    """最终响应发出后保持连接打开，等待客户端主动关闭。"""
-    logger.info(
-        "Waiting for client close: sid=%s",
-        session.sid if session else "?",
-    )
-    while True:
-        await websocket.receive_text()
-
-
-async def _wait_for_client_disconnect_safely(
-    websocket: WebSocket,
-    session: ASRSession | None = None,
-) -> None:
-    """等待客户端关闭；吞掉断开异常，避免覆盖原始处理分支。"""
+    """服务端主动关闭 WebSocket 连接，避免无限等待客户端断开。"""
     try:
-        await _wait_for_client_disconnect(websocket, session)
-    except (WebSocketDisconnect, RuntimeError):
-        logger.info("Client disconnected: sid=%s", session.sid if session else "?")
+        await asyncio.wait_for(websocket.close(), timeout=3.0)
+    except Exception:
+        pass
 
 
 async def _process_segment(
@@ -344,10 +406,16 @@ async def _process_segment(
         asr_processing_latency_ms.observe(total_ms)
         asr_segments_total.inc()
 
+        audio_ms = len(audio_int16) / 16.0
+        conn_ms_at_spawn = int((t0 - session._connection_start_time) * 1000)
         logger.info(
-            "Segment processed: seg_id=%d, text=%s, asr=%.0fms, total=%.0fms",
+            "Segment processed: seg_id=%d, text=%s, audio=%.0fms, pos=[%d-%d]ms, conn=%dms, asr=%.0fms, total=%.0fms",
             seg_id,
             final_text,
+            audio_ms,
+            bg_ms,
+            ed_ms,
+            conn_ms_at_spawn,
             asr_ms,
             total_ms,
         )
