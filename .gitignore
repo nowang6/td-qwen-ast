@@ -1,4 +1,7 @@
 *.pyc
 __pycache__/
-*.wav
 .env
+*.egg-info/
+*.txt
+*tts.py
+*.wav

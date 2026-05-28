@@ -25,6 +25,11 @@ dev = [
     "mypy>=1.11.0",
 ]
 
+[tool.pyrefly]
+python-version = "3.11"
+search_path = ["."]
+reportMissingImports = "none"
+
 [tool.ruff]
 target-version = "py311"
 line-length = 100
